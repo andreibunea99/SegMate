@@ -1,0 +1,281 @@
+# balanced_dataloader_25D_film_amos22.py
+"""
+Balanced slice DataLoader for AMOS22 dataset - 2.5D with FiLM z_norm
+============================================================================================
+AMOS22-specific version with resizing augmentations to handle variable image sizes.
+
+Key differences from SegTHOR version:
+- Uses amos22_augmentations (with Resize(512,512)) instead of segthor_augmentations
+- Handles variable image sizes in AMOS22 dataset (512x512, 768x768, etc.)
+"""
+
+import os, csv, random, math
+from typing import List, Dict, Tuple
+from pathlib import Path
+from collections import defaultdict
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, Sampler
+from utils.amos22_augmentations import get_augmentations
+
+# ----------------------------- CSV Index -----------------------------
+
+class SliceIndex:
+    def __init__(self, csv_path: str):
+        self.entries: List[str] = []
+        self.organ_names: List[str] = []
+        self.indices_by_cls: List[List[int]] = []
+        self.metadata = {}
+
+        # NEW: Per-patient organ boundaries for z_norm computation
+        self.patient_bounds: Dict[str, Tuple[int, int]] = {}
+
+        # Temporary storage for building patient bounds
+        patient_slices: Dict[str, List[Tuple[int, List[int]]]] = defaultdict(list)
+
+        with open(csv_path) as f:
+            rdr = csv.reader(f)
+            header = next(rdr)
+            self.organ_names = header[1:]
+            self.indices_by_cls = [[] for _ in self.organ_names]
+
+            for idx, row in enumerate(rdr):
+                path = row[0]
+                self.entries.append(path)
+                presence = list(map(int, row[1:]))
+                self.metadata[path] = presence
+                for i, flag in enumerate(presence):
+                    if flag:
+                        self.indices_by_cls[i].append(idx)
+
+                # Extract patient_id and slice_idx for boundary computation
+                # Format: "imagesTrain/s0910_chunk000_slice042.npz" -> patient_id="s0910", slice_idx=42
+                try:
+                    parts = path.split("/")[1]  # "s0910_chunk000_slice042.npz"
+                    patient_id = parts.split("_chunk")[0]  # "s0910"
+                    slice_tag = parts.split("_slice")[1]  # "042.npz"
+                    slice_idx = int(slice_tag.split(".")[0])  # 42
+
+                    patient_slices[patient_id].append((slice_idx, presence))
+                except (IndexError, ValueError):
+                    # Skip malformed entries
+                    continue
+
+        # Build patient organ boundaries
+        self._build_patient_bounds(patient_slices)
+
+    def _build_patient_bounds(self, patient_slices: Dict[str, List[Tuple[int, List[int]]]]):
+        """Compute first/last slice containing any organ for each patient."""
+        for patient_id, slices in patient_slices.items():
+            # Find slices with any organ present
+            slices_with_organs = [
+                slice_idx for slice_idx, presence in slices
+                if any(presence)
+            ]
+
+            if slices_with_organs:
+                first_organ = min(slices_with_organs)
+                last_organ = max(slices_with_organs)
+                self.patient_bounds[patient_id] = (first_organ, last_organ)
+            else:
+                # Fallback: use full range of available slices
+                all_slice_indices = [s[0] for s in slices]
+                if all_slice_indices:
+                    self.patient_bounds[patient_id] = (min(all_slice_indices), max(all_slice_indices))
+
+        print(f"[SliceIndex] Built organ boundaries for {len(self.patient_bounds)} patients")
+
+
+# ----------------------------- Sampler -----------------------------
+
+class BalancedBatchSampler(Sampler[List[int]]):
+    def __init__(self, valid_indices: List[int], batch_size: int, seed: int = 42):
+        self.valid = valid_indices
+        self.batch = batch_size
+        self.rng = random.Random(seed)
+
+        # Calculate the expected number of complete batches at initialization
+        self.num_batches = len(valid_indices) // batch_size
+
+        # Ensure we have at least one batch if there are any valid indices
+        if len(valid_indices) > 0 and self.num_batches == 0:
+            self.num_batches = 1
+
+    def __iter__(self):
+        indices = list(self.valid)
+        if not indices:
+            raise ValueError("Empty valid_indices list in sampler")
+
+        self.rng.shuffle(indices)
+        pos = 0
+        batch_count = 0
+
+        # Only yield up to self.num_batches batches
+        while batch_count < self.num_batches:
+            batch = set()
+            attempts = 0
+
+            while len(batch) < self.batch and attempts < self.batch * 3:
+                if pos >= len(indices):
+                    self.rng.shuffle(indices)
+                    pos = 0
+
+                idx = indices[pos]
+                pos += 1
+
+                if idx not in batch:
+                    batch.add(idx)
+
+                attempts += 1
+
+            if len(batch) == self.batch:
+                yield list(batch)
+                batch_count += 1
+            else:
+                # If we can't form a complete batch, stop iteration
+                break
+
+    def __len__(self):
+        return self.num_batches
+
+
+# ----------------------------- Dataset -----------------------------
+
+class ChunkedSliceDatasetFiLM(Dataset):
+    """Dataset that returns (image, label, z_norm) tuples for FiLM conditioning."""
+
+    def __init__(self, root: str, split: str, si: SliceIndex, transform=None):
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.slice_index = si
+
+        prefix = f"images{split.capitalize()}"
+        self.paths = [p for p in si.entries if p.startswith(prefix)]
+        self.valid_indices = []
+
+        for idx, path in enumerate(self.paths):
+            try:
+                chunk_id = path.split("/")[1].split("_slice")[0]
+                img_npz = os.path.join(root, f"images{split.capitalize()}", f"{chunk_id}.npz")
+                lbl_npz = os.path.join(root, f"labels{split.capitalize()}", f"{chunk_id}.npz")
+                if os.path.exists(img_npz) and os.path.exists(lbl_npz):
+                    self.valid_indices.append(idx)
+                else:
+                    print(f"[Missing] {img_npz} or {lbl_npz} not found.")
+            except Exception as e:
+                print(f"[DatasetInitError] path={path}, error={e}")
+
+        print(f"[ChunkedSliceDatasetFiLM] Split='{split}' -> {len(self.valid_indices)} valid slices out of {len(self.paths)}")
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.valid_indices[idx]
+        path = self.paths[real_idx]
+        chunk_id, slice_tag = path.split("/")[1].split("_slice")
+        slice_idx = int(slice_tag.split(".")[0])
+
+        # Extract patient_id from chunk_id (e.g., "s0910_chunk000" -> "s0910")
+        patient_id = chunk_id.split("_chunk")[0]
+
+        img_npz = os.path.join(self.root, f"images{self.split.capitalize()}", f"{chunk_id}.npz")
+        lbl_npz = os.path.join(self.root, f"labels{self.split.capitalize()}", f"{chunk_id}.npz")
+
+        img_data = np.load(img_npz, allow_pickle=True)
+        lbl_data = np.load(lbl_npz, allow_pickle=True)
+
+        idx_arr = img_data["indices"]          # slice indices available in this chunk
+        pos = np.where(idx_arr == slice_idx)[0][0]
+
+        # ------------------ 2.5D: pick (t-1, t, t+1) and stack as 3 channels ------------------
+        data = img_data["data"]                # shape: [N, H, W]
+        total_slices = len(idx_arr)
+
+        pos_m1 = max(pos - 1, 0)
+        pos_p1 = min(pos + 1, total_slices - 1)
+
+        img_m1 = data[pos_m1].astype(np.float32)
+        img_0  = data[pos].astype(np.float32)
+        img_p1 = data[pos_p1].astype(np.float32)
+
+        # Albumentations likes HWC for multi-channel images
+        img = np.stack([img_m1, img_0, img_p1], axis=-1)   # (H, W, 3)
+
+        # ------------------ labels: keep original logic ------------------
+        lbl = lbl_data["data"]
+        C = lbl.shape[0] // total_slices
+        if lbl.shape[0] % total_slices != 0:
+            raise ValueError(
+                f"[Slice shape mismatch] {chunk_id}: total_lbl={lbl.shape[0]}, slices={total_slices} -> Cannot divide."
+            )
+
+        lbl = lbl[pos * C : (pos + 1) * C]                 # (C, H, W) or (C, ?, ?)
+        if lbl.ndim == 3 and lbl.shape[0] != img.shape[0]:
+            # make it HWC: (H, W, C)
+            lbl = np.transpose(lbl, (1, 2, 0))
+
+        # img is (H, W, 3), lbl is (H, W, C)
+        if img.shape[:2] != lbl.shape[:2]:
+            raise ValueError(
+                f"[Shape mismatch before augment] IMG {img.shape}, LBL {lbl.shape} at {chunk_id}_slice{slice_idx}"
+            )
+
+        # ------------------ Compute organ-relative z_norm ------------------
+        # Get organ boundaries for this patient
+        first_organ, last_organ = self.slice_index.patient_bounds.get(
+            patient_id, (0, slice_idx)  # fallback if not found
+        )
+
+        # Compute organ-relative z_norm
+        organ_range = max(last_organ - first_organ, 1)  # Avoid division by zero
+        z_norm = (slice_idx - first_organ) / organ_range
+        z_norm = np.clip(z_norm, 0.0, 1.0).astype(np.float32)
+
+        # ------------------ augment / tensor conversion ------------------
+        if self.transform:
+            aug = self.transform(image=img, mask=lbl)
+            img = aug["image"]                               # should be torch.Tensor [3, H, W]
+            lbl = aug["mask"].permute(2, 0, 1)              # [C, H, W]
+        else:
+            img = torch.tensor(img).permute(2, 0, 1)         # [3, H, W]
+            lbl = torch.tensor(lbl).permute(2, 0, 1)         # [C, H, W]
+
+        return img.float(), lbl.float(), torch.tensor(z_norm)
+
+
+# ----------------------------- Loader Factory -----------------------------
+
+def get_dataloaders_balanced_film_amos22(root: str, batch_size: int = 60, num_workers: int = 8):
+    """Create dataloaders for AMOS22 that return (image, label, z_norm) tuples."""
+    csv_path = os.path.join(root, "slice_index.csv")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError("slice_index.csv missing - run prepare_dataset first")
+
+    si = SliceIndex(csv_path)
+    train_ds = ChunkedSliceDatasetFiLM(root, "Train", si, get_augmentations(True))
+    val_ds   = ChunkedSliceDatasetFiLM(root, "Val",   si, get_augmentations(False))
+    test_ds  = ChunkedSliceDatasetFiLM(root, "Test",  si, get_augmentations(False))
+
+    train_ld = DataLoader(
+        train_ds,
+        batch_sampler=BalancedBatchSampler(train_ds.valid_indices, batch_size),
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    val_ld = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    test_ld = DataLoader(
+        test_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers
+    )
+
+    return train_ld, val_ld, test_ld
